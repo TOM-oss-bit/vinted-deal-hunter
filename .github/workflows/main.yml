@@ -1,5 +1,4 @@
 
-
 name: Vinted Deal Hunter Monitor
 
 on:
@@ -19,7 +18,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      
       - name: Test połączenia z Discordem
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
@@ -32,7 +30,7 @@ jobs:
 
           url = os.environ.get("DISCORD_WEBHOOK", "").strip()
           if not url.startswith("https://discord.com/api/webhooks/"):
-              raise SystemExit("Sekret jest pusty lub nie ma oczekiwanego formatu webhooka Discorda.")
+              raise SystemExit("Sekret jest pusty lub ma nieprawidłowy format.")
 
           req = urllib.request.Request(
               url,
@@ -51,8 +49,3 @@ jobs:
               print("Odpowiedź:", e.read(500).decode("utf-8", "replace"))
               raise SystemExit(1)
           PY
-
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          python -c "import os, urllib.request, json; u=os.environ.get('DISCORD_WEBHOOK',''); assert u.startswith('https://'), 'Brak sekretu DISCORD_WEBHOOK'; r=urllib.request.Request(u, data=json.dumps({'content':'✅ Vinted Deal Hunter: połączenie z GitHub Actions działa!'}).encode(), headers={'Content-Type':'application/json'}, method='POST'); print('Discord HTTP:', urllib.request.urlopen(r, timeout=15).status)"
