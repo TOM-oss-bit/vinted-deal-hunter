@@ -1,4 +1,5 @@
 
+
 name: Vinted Deal Hunter Monitor
 
 on:
@@ -18,5 +19,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Sprawdź uruchomienie
-        run: python -c "print('Monitor uruchomiony poprawnie')"
+      - name: Test połączenia z Discordem
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          python -c "import os, urllib.request, json; u=os.environ.get('DISCORD_WEBHOOK',''); assert u.startswith('https://'), 'Brak sekretu DISCORD_WEBHOOK'; r=urllib.request.Request(u, data=json.dumps({'content':'✅ Vinted Deal Hunter: połączenie z GitHub Actions działa!'}).encode(), headers={'Content-Type':'application/json'}, method='POST'); print('Discord HTTP:', urllib.request.urlopen(r, timeout=15).status)"
