@@ -1,1 +1,48 @@
-[]
+
+[
+  {
+    "id": "test-001",
+    "title": "Nike Tech Fleece hoodie",
+    "url": "https://www.vinted.pl/",
+    "price": 29,
+    "currency": "PLN",
+    "size": "M",
+    "condition": "Bardzo dobry"
+  },
+  {
+    "id": "test-002",
+    "title": "Nike Shox TL",
+    "url": "https://www.vinted.pl/",
+    "price": 99,
+    "currency": "PLN",
+    "size": "42",
+    "condition": "Dobry"
+  },
+  {
+    "id": "test-003",
+    "title": "The North Face Nuptse 700",
+    "url": "https://www.vinted.pl/",
+    "price": 85,
+    "currency": "PLN",
+    "size": "L",
+    "condition": "Bardzo dobry"
+  },
+  {
+    "id": "test-004",
+    "title": "Ralph Lauren Quarter Zip",
+    "url": "https://www.vinted.pl/",
+    "price": 55,
+    "currency": "PLN",
+    "size": "M",
+    "condition": "Bardzo dobry"
+  },
+  {
+    "id": "test-005",
+    "title": "Moncler Maya",
+    "url": "https://www.vinted.pl/",
+    "price": 150,
+    "currency": "PLN",
+    "size": "L",
+    "condition": "Dobry"
+  }
+]
