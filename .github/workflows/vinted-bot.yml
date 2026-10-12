@@ -1,0 +1,50 @@
+
+name: Vinted Deal Hunter Bot
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vinted-deal-hunter
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Pobierz repozytorium
+        uses: actions/checkout@v4
+
+      - name: Ustaw Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Zainstaluj zależności
+        run: python -m pip install requests
+
+      - name: Skanuj Vinted i wysyłaj alerty
+        env:
+          EXTRACTR_API_KEY: ${{ secrets.EXTRACTR_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          VINTED_QUERY: "Salomon ACS"
+          MAX_PRICE: "0"
+        run: python bot.py
+
+      - name: Zapisz historię ofert
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add seen_listings.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update Vinted listing history"
+            git push
+          fi
