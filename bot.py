@@ -1,4 +1,4 @@
-
+```python
 import json
 import os
 import time
@@ -6,7 +6,6 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 import requests
-
 
 API_URL = "https://api.extractr.dev/vinted/search"
 STATE_FILE = Path("seen_listings.json")
@@ -16,8 +15,9 @@ WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 QUERY = os.getenv("VINTED_QUERY", "Salomon ACS").strip()
 MAX_PRICE = int(os.getenv("MAX_PRICE", "0"))
-MAX_ATTEMPTS = 3
-RETRY_DELAYS = [5, 15]
+
+MAX_ATTEMPTS = 4
+RETRY_DELAYS = [10, 20, 40]
 
 
 def load_state():
@@ -27,10 +27,9 @@ def load_state():
     try:
         data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         return set(str(x) for x in data.get("seen", []))
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError) as exc:
         raise RuntimeError(
-            "Nie można odczytać seen_listings.json. "
-            "Przerywam, aby nie wysłać przypadkowo wielu duplikatów."
+            f"Nie można odczytać historii ofert: {exc}"
         )
 
 
@@ -39,6 +38,7 @@ def save_state(seen_ids):
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "seen": sorted(seen_ids),
     }
+
     STATE_FILE.write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -46,33 +46,33 @@ def save_state(seen_ids):
 
 
 def extract_items(data):
-    if isinstance(data, list):
-        if any(
-            isinstance(x, dict)
-            and any(k in x for k in ("listing_id", "id", "url"))
-            for x in data
-        ):
-            return data
+    if isinstance(data, dict):
+        for key in ("listings", "items", "results", "offers", "products"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+
+        value = data.get("data")
+        if isinstance(value, (dict, list)):
+            result = extract_items(value)
+            if result:
+                return result
+
+        if any(k in data for k in ("listing_id", "id")):
+            return [data]
+
+    elif isinstance(data, list):
+        if all(isinstance(item, dict) for item in data):
+            if not data or any(
+                k in item for item in data
+                for k in ("listing_id", "id", "url")
+            ):
+                return data
 
         for value in data:
             result = extract_items(value)
             if result:
                 return result
-
-        return []
-
-    if isinstance(data, dict):
-        for key in (
-            "listings", "items", "results",
-            "offers", "products", "data",
-        ):
-            if key in data:
-                result = extract_items(data[key])
-                if result:
-                    return result
-
-        if any(k in data for k in ("listing_id", "id")):
-            return [data]
 
     return []
 
@@ -103,28 +103,32 @@ def get_listings():
                 timeout=30,
             )
         except requests.RequestException as exc:
-            if attempt < MAX_ATTEMPTS - 1:
-                time.sleep(RETRY_DELAYS[attempt])
-                continue
-            raise RuntimeError(f"Błąd połączenia z Extractr: {exc}")
+            print(f"Błąd połączenia: {exc}")
 
-        if response.status_code == 429:
-            raise RuntimeError(
-                "Extractr zwrócił HTTP 429 — limit zapytań."
-            )
+            if attempt < MAX_ATTEMPTS - 1:
+                delay = RETRY_DELAYS[attempt]
+                print(f"Ponawiam za {delay} s.")
+                time.sleep(delay)
+                continue
+
+            print("Nie udało się połączyć z Extractr.")
+            return None
 
         if response.status_code in (502, 503, 504):
+            print(f"Extractr HTTP {response.status_code}.")
+
             if attempt < MAX_ATTEMPTS - 1:
-                print(
-                    f"Extractr HTTP {response.status_code}; "
-                    f"ponawiam za {RETRY_DELAYS[attempt]} s."
-                )
-                time.sleep(RETRY_DELAYS[attempt])
+                delay = RETRY_DELAYS[attempt]
+                print(f"Ponawiam za {delay} s.")
+                time.sleep(delay)
                 continue
 
-            raise RuntimeError(
-                f"Extractr nadal zwraca HTTP {response.status_code}."
-            )
+            print("API nadal nie odpowiada. Pomijam ten skan.")
+            return None
+
+        if response.status_code == 429:
+            print("Extractr HTTP 429: limit zapytań. Pomijam skan.")
+            return None
 
         if not response.ok:
             raise RuntimeError(
@@ -135,15 +139,18 @@ def get_listings():
         try:
             data = response.json()
         except ValueError:
-            raise RuntimeError("Extractr nie zwrócił poprawnego JSON.")
+            raise RuntimeError("Extractr zwrócił niepoprawny JSON.")
 
         items = extract_items(data)
+
         if not items:
             raise RuntimeError(
-                "Nie znaleziono ofert w odpowiedzi Extractr."
+                "Odpowiedź API nie zawiera rozpoznawalnych ofert. "
+                "Historia nie została zmieniona."
             )
 
         listings = []
+
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -160,8 +167,16 @@ def get_listings():
 
             listings.append({
                 "id": str(listing_id),
-                "title": str(item.get("title") or item.get("name") or "Oferta Vinted"),
-                "url": str(item.get("url") or item.get("share_url") or ""),
+                "title": str(
+                    item.get("title")
+                    or item.get("name")
+                    or "Oferta Vinted"
+                ),
+                "url": str(
+                    item.get("url")
+                    or item.get("share_url")
+                    or ""
+                ),
                 "price": str(
                     item.get("price")
                     or item.get("total_price")
@@ -171,13 +186,25 @@ def get_listings():
                 "currency": str(item.get("currency") or "PLN"),
                 "brand": str(item.get("brand") or "Nie podano"),
                 "size": str(item.get("size") or "Nie podano"),
-                "condition": str(item.get("condition") or "Nie podano"),
-                "image": str(item.get("image") or item.get("thumbnail") or ""),
+                "condition": str(
+                    item.get("condition") or "Nie podano"
+                ),
+                "image": str(
+                    item.get("image")
+                    or item.get("thumbnail")
+                    or ""
+                ),
             })
+
+        if not listings:
+            raise RuntimeError(
+                "API odpowiedziało, ale nie udało się odczytać "
+                "identyfikatorów ofert. Historia zachowana."
+            )
 
         return listings
 
-    raise RuntimeError("Nie udało się pobrać ofert.")
+    return None
 
 
 def send_discord(listing):
@@ -221,16 +248,25 @@ def main():
         raise RuntimeError("Brak sekretu DISCORD_WEBHOOK_URL.")
 
     print(f"Szukam ofert: {QUERY}")
+
     listings = get_listings()
+
+    if listings is None:
+        print(
+            "Skan nieudany. Historia ofert nie została zmieniona. "
+            "Spróbuj ponownie przy kolejnym uruchomieniu."
+        )
+        return
+
     print(f"Sprawdzone oferty: {len(listings)}")
 
     known = load_state()
 
-    # Pierwszy przebieg zapisuje aktualne oferty bez wysyłania alertów.
+    # Pierwszy przebieg zapisuje stan początkowy bez alertów.
     if known is None:
         save_state({item["id"] for item in listings})
         print(
-            "Zapisano stan początkowy bez alertów. "
+            "Zapisano stan początkowy. "
             "Nowe oferty będą zgłaszane przy kolejnych skanach."
         )
         return
@@ -243,12 +279,16 @@ def main():
 
         send_discord(listing)
         known.add(listing["id"])
+        save_state(known)
+
         sent += 1
         print(f"Wysłano alert: {listing['title']}")
 
+    # Zapisujemy również historię, gdy nie znaleziono nowych ofert.
     save_state(known)
     print(f"Wysłane alerty: {sent}")
 
 
 if __name__ == "__main__":
     main()
+```
