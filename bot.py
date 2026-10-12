@@ -15,46 +15,9 @@ API_KEY = os.getenv("EXTRACTR_API_KEY", "").strip()
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 SEARCHES = [
-    {
-        "query": "Nike Shox",
-        "max_price": 100,
-        "keywords": ["shox"],
-        "required_groups": [["nike"]],
-        "blocked": [
-            "card", "rookie", "patch", "autograph",
-            "haliburton", "curry", "leonard", "lavine",
-            "basketball card", "karta"
-        ],
-        "must_match_any": ["shox"],
-    },
-    {
-        "query": "Moncler Maya",
-        "max_price": 150,
-        "keywords": ["moncler", "maya"],
-        "required_groups": [["moncler"], ["maya"]],
-        "blocked": [
-            "etui", "case", "pokrowiec", "wieszak",
-            "hanger", "metka", "tag", "torba na ubrania"
-        ],
-        "must_match_any": ["kurtka", "jacket", "maya", "moncler"],
-    },
-    {
-        "query": "Ralph Lauren Quarter Zip",
-        "max_price": 30,
-        "keywords": ["quarter", "zip"],
-        "required_groups": [
-            ["ralph lauren", "polo ralph lauren", "chaps"]
-        ],
-        "blocked": [
-            "traders", "tommy hilfiger", "karta", "card",
-            "sukienka", "dress", "spódnica", "skirt"
-        ],
-        "must_match_any": [
-            "quarter zip", "quarter-zip", "1/4 zip",
-            "half zip", "half-zip", "polo ralph lauren",
-            "ralph lauren", "chaps"
-        ],
-    },
+    {"query": "Nike Shox", "max_price": 100},
+    {"query": "Moncler Maya", "max_price": 150},
+    {"query": "Ralph Lauren Quarter Zip", "max_price": 30},
 ]
 
 MAX_ATTEMPTS = 4
@@ -94,61 +57,83 @@ def save_state(seen_ids):
     )
 
 
-def matches_search(item, search):
+def matches_search(item, query):
     title = normalize(item.get("title", ""))
     brand = normalize(item.get("brand", ""))
     text = f"{title} {brand}"
 
-    # Każda grupa wymaga przynajmniej jednego dopasowania.
-    for group in search["required_groups"]:
-        if not any(normalize(word) in text for word in group):
-            return False
-
-    # Odrzucamy oczywiste, niepasujące wyniki.
-    for word in search["blocked"]:
-        if normalize(word) in title:
-            return False
-
-    # Wymagane słowa muszą wystąpić w tytule.
-    title_normalized = normalize(title)
-    if not any(
-        normalize(word) in title_normalized
-        for word in search["must_match_any"]
-    ):
-        return False
-
-    if search["query"] == "Nike Shox":
-        # Samo słowo "Shox" bez Nike nie wystarczy.
+    if query == "Nike Shox":
         if "nike" not in text or "shox" not in title:
             return False
 
-    if search["query"] == "Moncler Maya":
+        clothing_words = [
+            "kurtka", "kurtkę", "kurtki", "bluza", "bluzy",
+            "koszulka", "koszulki", "t shirt", "spodenki",
+            "spodnie", "czapka", "czapki", "hoodie",
+            "sweatshirt", "jacket", "shirt", "shorts",
+            "trousers", "card", "rookie", "autograph",
+            "patch", "wiatrówka", "wiatrowka"
+        ]
+
+        if any(word in title for word in clothing_words):
+            return False
+
+        shoe_words = [
+            "buty", "sneakers", "sneaker", "shoes",
+            "obuwie", "tenisówki", "tenisky", "trainers",
+            "trampki", "sneakerów", "sneakersy"
+        ]
+
+        # Tytuł musi wyraźnie wskazywać na obuwie.
+        if not any(word in title for word in shoe_words):
+            return False
+
+        return True
+
+    if query == "Moncler Maya":
         if "moncler" not in text or "maya" not in title:
             return False
 
-    if search["query"] == "Ralph Lauren Quarter Zip":
-        has_brand = any(
-            word in text
-            for word in [
-                "ralph lauren",
-                "polo ralph lauren",
-                "chaps",
-            ]
-        )
-        has_zip = any(
-            word in title
-            for word in [
-                "quarter zip",
-                "quarter-zip",
-                "1 4 zip",
-                "half zip",
-                "half-zip",
-            ]
-        )
-        if not has_brand or not has_zip:
+        blocked = [
+            "etui", "case", "pokrowiec", "wieszak",
+            "hanger", "metka", "tag", "torba"
+        ]
+
+        if any(word in title for word in blocked):
             return False
 
-    return True
+        jacket_words = [
+            "kurtka", "jacket", "puffer", "down jacket",
+            "parka", "kurtkę", "kurtki"
+        ]
+
+        return any(word in title for word in jacket_words)
+
+    if query == "Ralph Lauren Quarter Zip":
+        brands = ["ralph lauren", "polo ralph lauren", "chaps"]
+
+        if not any(brand_name in text for brand_name in brands):
+            return False
+
+        zip_phrases = [
+            "quarter zip", "1 4 zip", "half zip",
+            "quarterzip", "halfzip"
+        ]
+
+        if not any(phrase in title for phrase in zip_phrases):
+            return False
+
+        blocked = [
+            "traders", "tommy hilfiger", "karta", "card",
+            "sukienka", "dress", "spódnica", "skirt"
+        ]
+
+        if any(word in title for word in blocked):
+            return False
+
+        return True
+
+    return False
 
 
 def get_listings(search):
@@ -188,10 +173,7 @@ def get_listings(search):
             return None
 
         if response.status_code in (429, 502, 503, 504):
-            print(
-                f"[{query}] Extractr HTTP "
-                f"{response.status_code}"
-            )
+            print(f"[{query}] Extractr HTTP {response.status_code}")
             if attempt < MAX_ATTEMPTS - 1:
                 delay = RETRY_DELAYS[attempt]
                 print(f"Ponawiam za {delay} s.")
@@ -241,7 +223,7 @@ def get_listings(search):
             if price < 0 or price > max_price:
                 continue
 
-            if not matches_search(item, search):
+            if not matches_search(item, query):
                 print(
                     f"[{query}] Odrzucono: "
                     f"{item.get('title', 'bez tytułu')}"
@@ -365,9 +347,7 @@ def main():
             failed_searches += 1
             print("To wyszukiwanie pominięto.")
         else:
-            print(
-                f"Pasujące oferty po filtrze: {len(listings)}"
-            )
+            print(f"Pasujące oferty po filtrze: {len(listings)}")
             all_listings.extend(listings)
 
         if index < len(SEARCHES) - 1:
