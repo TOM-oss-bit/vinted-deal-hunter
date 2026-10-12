@@ -1,6 +1,5 @@
 
 import os
-import re
 import time
 import sqlite3
 from datetime import datetime, timezone
@@ -21,8 +20,13 @@ st.set_page_config(
 
 API_URL = "https://api.extractr.dev/vinted/search"
 DB_PATH = "vinted_deals.db"
+
 REQUEST_TIMEOUT = 30
 PAUSE_BETWEEN_QUERIES = 42
+
+# Automatyczne ponawianie tylko przy przejściowych błędach serwera.
+MAX_SERVER_ATTEMPTS = 3
+RETRY_DELAYS = [5, 15]
 
 CATALOG = [
     "Salomon ACS",
@@ -91,7 +95,6 @@ def initialize_database():
             for row in conn.execute("PRAGMA table_info(seen)").fetchall()
         }
 
-        # Obsługa starszej wersji bazy danych.
         if "title" not in columns:
             conn.execute("ALTER TABLE seen ADD COLUMN title TEXT")
 
@@ -102,8 +105,6 @@ def initialize_database():
             conn.execute("ALTER TABLE seen ADD COLUMN first_seen TEXT")
 
         if "notified" not in columns:
-            # Oferty zapisane przez starszą wersję traktujemy jako już
-            # obsłużone, aby nie wysłać nagle wielu starych alertów.
             conn.execute(
                 "ALTER TABLE seen ADD COLUMN notified INTEGER DEFAULT 1"
             )
@@ -120,11 +121,13 @@ def is_known(listing_id):
             "SELECT 1 FROM seen WHERE listing_id = ?",
             (str(listing_id),),
         ).fetchone()
+
     return row is not None
 
 
 def save_listing(listing):
     listing_id = str(listing.get("listing_id", "")).strip()
+
     if not listing_id:
         return False
 
@@ -148,16 +151,18 @@ def save_listing(listing):
 
 def count_saved():
     with db_connect() as conn:
-        row = conn.execute("SELECT COUNT(*) AS total FROM seen").fetchone()
+        row = conn.execute(
+            "SELECT COUNT(*) AS total FROM seen"
+        ).fetchone()
+
     return int(row["total"])
 
 
 # =========================
-# EXTRACTR
+# ODCZYT ODPOWIEDZI EXTRACTR
 # =========================
 
 def extract_items(data):
-    """Odnajduje listę ofert także w zagnieżdżonej odpowiedzi JSON."""
     if isinstance(data, list):
         if not data:
             return []
@@ -177,7 +182,6 @@ def extract_items(data):
         return []
 
     if isinstance(data, dict):
-        # Najbardziej prawdopodobne nazwy pól zawierających oferty.
         for key in (
             "listings",
             "items",
@@ -191,7 +195,6 @@ def extract_items(data):
                 if result:
                     return result
 
-        # Niektóre odpowiedzi mogą zawierać pojedynczą ofertę.
         if any(key in data for key in ("listing_id", "id")):
             return [data]
 
@@ -211,7 +214,6 @@ def normalize_listing(item):
     url = item.get("url") or item.get("share_url") or ""
     title = item.get("title") or item.get("name") or "Oferta Vinted"
 
-    # Jeśli API nie udostępnia ID, spróbuj użyć URL.
     if not listing_id and url:
         listing_id = url
 
@@ -225,24 +227,24 @@ def normalize_listing(item):
         or "Brak danych"
     )
 
-    currency = item.get("currency") or "PLN"
-    brand = item.get("brand") or "Nie podano"
-    size = item.get("size") or "Nie podano"
-    condition = item.get("condition") or "Nie podano"
-    image = item.get("image") or item.get("thumbnail") or ""
-
     return {
         "listing_id": str(listing_id),
         "title": str(title),
         "url": str(url),
         "price": str(price),
-        "currency": str(currency),
-        "brand": str(brand),
-        "size": str(size),
-        "condition": str(condition),
-        "image": str(image),
+        "currency": str(item.get("currency") or "PLN"),
+        "brand": str(item.get("brand") or "Nie podano"),
+        "size": str(item.get("size") or "Nie podano"),
+        "condition": str(item.get("condition") or "Nie podano"),
+        "image": str(
+            item.get("image") or item.get("thumbnail") or ""
+        ),
     }
 
+
+# =========================
+# EXTRACTR Z PONAWIANIEM
+# =========================
 
 def load_extractr(query, api_key, max_price):
     params = {
@@ -261,54 +263,109 @@ def load_extractr(query, api_key, max_price):
         "Accept": "application/json",
     }
 
-    response = requests.get(
-        API_URL,
-        params=params,
-        headers=headers,
-        timeout=REQUEST_TIMEOUT,
+    last_error = None
+
+    for attempt in range(MAX_SERVER_ATTEMPTS):
+        try:
+            response = requests.get(
+                API_URL,
+                params=params,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+        except requests.Timeout:
+            last_error = (
+                f"Przekroczono limit czasu ({REQUEST_TIMEOUT} s)."
+            )
+
+            if attempt < MAX_SERVER_ATTEMPTS - 1:
+                delay = RETRY_DELAYS[attempt]
+                time.sleep(delay)
+                continue
+
+            raise RuntimeError(
+                f"Extractr nie odpowiedział po "
+                f"{MAX_SERVER_ATTEMPTS} próbach. {last_error}"
+            )
+
+        except requests.RequestException as exc:
+            last_error = f"Błąd połączenia: {exc}"
+
+            if attempt < MAX_SERVER_ATTEMPTS - 1:
+                delay = RETRY_DELAYS[attempt]
+                time.sleep(delay)
+                continue
+
+            raise RuntimeError(
+                f"Nie udało się połączyć z Extractr. {last_error}"
+            )
+
+        # Limit API: nie ponawiamy zapytania.
+        if response.status_code == 429:
+            raise RuntimeError(
+                "LIMIT 429: Extractr ograniczył liczbę zapytań. "
+                "Poczekaj przed kolejnym skanem."
+            )
+
+        # Przejściowe błędy serwera: ponawiamy ograniczoną liczbę razy.
+        if response.status_code in (502, 503, 504):
+            last_error = (
+                f"HTTP {response.status_code}: "
+                f"{response.text[:300]}"
+            )
+
+            if attempt < MAX_SERVER_ATTEMPTS - 1:
+                delay = RETRY_DELAYS[attempt]
+                time.sleep(delay)
+                continue
+
+            raise RuntimeError(
+                f"Extractr nadal zwraca błąd serwera po "
+                f"{MAX_SERVER_ATTEMPTS} próbach. {last_error}"
+            )
+
+        if not response.ok:
+            raise RuntimeError(
+                f"Extractr HTTP {response.status_code}: "
+                f"{response.text[:500]}"
+            )
+
+        try:
+            data = response.json()
+        except ValueError:
+            raise RuntimeError(
+                "Extractr zwrócił odpowiedź, która nie jest poprawnym JSON-em."
+            )
+
+        items = extract_items(data)
+
+        if not items:
+            if isinstance(data, dict):
+                keys = ", ".join(
+                    str(key) for key in list(data.keys())[:20]
+                )
+                details = f"Klucze odpowiedzi: {keys or '(brak)'}"
+            else:
+                details = f"Typ odpowiedzi: {type(data).__name__}"
+
+            raise RuntimeError(
+                "Nie udało się znaleźć listy ofert w odpowiedzi Extractr. "
+                + details
+            )
+
+        normalized = []
+
+        for item in items:
+            listing = normalize_listing(item)
+            if listing:
+                normalized.append(listing)
+
+        return normalized
+
+    raise RuntimeError(
+        f"Nie udało się pobrać ofert. {last_error or ''}"
     )
-
-    if response.status_code == 429:
-        raise RuntimeError(
-            "LIMIT 429: Extractr ograniczył liczbę zapytań. "
-            "Poczekaj przed kolejnym skanem."
-        )
-
-    if not response.ok:
-        # Nie pokazujemy nagłówków, klucza API ani innych sekretów.
-        body = response.text[:500]
-        raise RuntimeError(
-            f"Extractr HTTP {response.status_code}: {body}"
-        )
-
-    try:
-        data = response.json()
-    except ValueError:
-        raise RuntimeError(
-            "Extractr zwrócił odpowiedź, która nie jest poprawnym JSON-em."
-        )
-
-    items = extract_items(data)
-
-    if not items:
-        if isinstance(data, dict):
-            keys = ", ".join(str(key) for key in list(data.keys())[:20])
-            details = f"Klucze odpowiedzi: {keys or '(brak)'}"
-        else:
-            details = f"Typ odpowiedzi: {type(data).__name__}"
-
-        raise RuntimeError(
-            "Odpowiedź Extractr nie zawiera rozpoznanej listy ofert. "
-            + details
-        )
-
-    normalized = []
-    for item in items:
-        listing = normalize_listing(item)
-        if listing:
-            normalized.append(listing)
-
-    return normalized
 
 
 # =========================
@@ -324,7 +381,6 @@ def send_discord(webhook_url, listing, query):
 
     embed = {
         "title": listing["title"][:256],
-        "url": listing["url"] or None,
         "description": (
             f"**Cena:** {listing['price']} {listing['currency']}\n"
             f"**Marka:** {listing['brand']}\n"
@@ -336,15 +392,16 @@ def send_discord(webhook_url, listing, query):
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    if listing["image"].startswith("https://") or listing["image"].startswith("http://"):
-        embed["thumbnail"] = {"url": listing["image"]}
+    if listing["url"].startswith(("https://", "http://")):
+        embed["url"] = listing["url"]
 
-    payload = {"embeds": [embed]}
+    if listing["image"].startswith(("https://", "http://")):
+        embed["thumbnail"] = {"url": listing["image"]}
 
     try:
         response = requests.post(
             webhook_url,
-            json=payload,
+            json={"embeds": [embed]},
             timeout=REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
@@ -353,9 +410,9 @@ def send_discord(webhook_url, listing, query):
         )
 
     if response.status_code not in (200, 204):
-        body = response.text[:500]
         raise RuntimeError(
-            f"Discord HTTP {response.status_code}: {body}"
+            f"Discord HTTP {response.status_code}: "
+            f"{response.text[:500]}"
         )
 
 
@@ -372,11 +429,17 @@ def scan_queries(queries, api_key, webhook_url, max_price):
 
     for index, query in enumerate(queries):
         query = query.strip()
+
         if not query:
             continue
 
         try:
-            listings = load_extractr(query, api_key, max_price)
+            listings = load_extractr(
+                query,
+                api_key,
+                max_price,
+            )
+
             checked += len(listings)
 
             for listing in listings:
@@ -387,24 +450,28 @@ def scan_queries(queries, api_key, webhook_url, max_price):
 
                 new_offers += 1
 
-                # Jeśli wysyłka nie powiedzie się, oferta NIE zostanie
-                # zapisana jako obsłużona. Kolejny skan spróbuje ponownie.
                 try:
-                    send_discord(webhook_url, listing, query)
+                    send_discord(
+                        webhook_url,
+                        listing,
+                        query,
+                    )
                 except Exception as exc:
-                    message = f"{query} — {listing['title']}: {exc}"
-                    errors.append(message)
+                    errors.append(
+                        f"{query} — {listing['title']}: {exc}"
+                    )
                     continue
 
-                # Zapis dopiero po potwierdzonej wysyłce.
                 if save_listing(listing):
                     sent += 1
 
         except Exception as exc:
-            message = f"{query}: {exc}"
-            errors.append(message)
+            errors.append(f"{query}: {exc}")
 
-            if "429" in str(exc) or "LIMIT" in str(exc).upper():
+            if (
+                "429" in str(exc)
+                or "LIMIT" in str(exc).upper()
+            ):
                 rate_limited = True
                 break
 
@@ -421,7 +488,7 @@ def scan_queries(queries, api_key, webhook_url, max_price):
 
 
 # =========================
-# INICJALIZACJA
+# ZAPIS BEZ ALERTÓW
 # =========================
 
 def seed_database(queries, api_key, max_price):
@@ -431,20 +498,28 @@ def seed_database(queries, api_key, max_price):
 
     for index, query in enumerate(queries):
         query = query.strip()
+
         if not query:
             continue
 
         try:
-            listings = load_extractr(query, api_key, max_price)
+            listings = load_extractr(
+                query,
+                api_key,
+                max_price,
+            )
 
             for listing in listings:
-                # Inicjalizacja celowo nie wysyła alertów.
                 if save_listing(listing):
                     saved += 1
 
         except Exception as exc:
             errors.append(f"{query}: {exc}")
-            if "429" in str(exc) or "LIMIT" in str(exc).upper():
+
+            if (
+                "429" in str(exc)
+                or "LIMIT" in str(exc).upper()
+            ):
                 rate_limited = True
                 break
 
@@ -455,7 +530,7 @@ def seed_database(queries, api_key, max_price):
 
 
 # =========================
-# INTERFEJS
+# INTERFEJS STREAMLIT
 # =========================
 
 initialize_database()
@@ -464,9 +539,9 @@ st.title("🔎 Vinted Deal Hunter")
 st.write("Monitor ofert Vinted i powiadomienia Discord.")
 
 st.info(
-    "Bot zapamiętuje identyfikatory ofert i wykrywa nowe pozycje. "
-    "To nie jest ścisły filtr ostatnich 24 godzin, ponieważ odpowiedź "
-    "Extractr może nie zawierać daty publikacji."
+    "Bot zapamiętuje identyfikatory ofert i wykrywa wcześniej "
+    "nieznane pozycje. To nie jest ścisły filtr ostatnich 24 godzin, "
+    "ponieważ API może nie udostępniać daty publikacji."
 )
 
 api_key = get_secret("EXTRACTR_API_KEY")
@@ -488,7 +563,7 @@ with st.sidebar:
 
     custom_queries_text = st.text_area(
         "Własne wyszukiwania (jedno na linię)",
-        placeholder="np.\nSalomon XT-6 42\nNike Shox",
+        placeholder="Salomon XT-6 42\nNike Shox",
     )
 
     max_price = st.number_input(
@@ -500,19 +575,15 @@ with st.sidebar:
     )
 
     st.caption(
-        "Przy wielu wyszukiwaniach skanowanie może potrwać dłużej, "
-        "ponieważ aplikacja robi przerwy, aby ograniczyć ryzyko limitu API."
+        "Błędy 502/503/504 są ponawiane automatycznie. "
+        "Przy wielu wyszukiwaniach bot robi przerwy między zapytaniami."
     )
 
 queries = list(selected_models)
-custom_queries = [
-    line.strip()
-    for line in custom_queries_text.splitlines()
-    if line.strip()
-]
 
-for query in custom_queries:
-    if query not in queries:
+for line in custom_queries_text.splitlines():
+    query = line.strip()
+    if query and query not in queries:
         queries.append(query)
 
 col1, col2 = st.columns(2)
@@ -532,23 +603,24 @@ with col2:
 
 if not api_key:
     st.error(
-        "Nie znaleziono EXTRACTR_API_KEY. "
-        "Dodaj go w ustawieniach Secrets aplikacji Streamlit."
+        "Brak EXTRACTR_API_KEY. Dodaj go w ustawieniach Secrets "
+        "aplikacji Streamlit."
     )
 
 if not webhook_url:
     st.warning(
-        "Nie znaleziono webhooka Discord. "
-        "Sprawdź nazwę sekretu DISCORD_WEBHOOK_URL."
+        "Brak webhooka Discord. Sprawdź sekret DISCORD_WEBHOOK_URL."
     )
 
 if scan_button:
     if not api_key:
         st.error("Nie można skanować bez EXTRACTR_API_KEY.")
     elif not queries:
-        st.warning("Wybierz przynajmniej jeden model lub wpisz własne wyszukiwanie.")
+        st.warning("Wybierz model lub wpisz własne wyszukiwanie.")
     else:
-        with st.spinner("Skanuję oferty..."):
+        with st.spinner(
+            "Skanuję oferty. W razie błędu serwera bot spróbuje ponownie..."
+        ):
             result = scan_queries(
                 queries,
                 api_key,
@@ -564,23 +636,27 @@ if scan_button:
         c.metric("Wysłane na Discord", result["sent"])
 
         if result["sent"] > 0:
-            st.success(f"Wysłano {result['sent']} powiadomień na Discord.")
+            st.success(
+                f"Wysłano {result['sent']} powiadomień na Discord."
+            )
 
         if result["new"] > result["sent"]:
             st.warning(
-                f"{result['new'] - result['sent']} nowych ofert nie otrzymało "
-                "powiadomienia. Nie zostały zapisane jako obsłużone, więc "
-                "kolejny skan może spróbować ponownie."
+                "Nie wszystkie nowe oferty otrzymały alert. "
+                "Sprawdź szczegóły błędów poniżej."
             )
 
         if result["rate_limited"]:
             st.warning(
-                "Wykryto limit API. Skanowanie przerwano, aby nie wykonywać "
-                "dalszych zapytań. Poczekaj przed kolejną próbą."
+                "Extractr zwrócił limit 429. Skanowanie zostało "
+                "przerwane. Poczekaj przed kolejną próbą."
             )
 
         if result["errors"]:
-            with st.expander("⚠️ Szczegóły błędów", expanded=True):
+            with st.expander(
+                "⚠️ Szczegóły błędów",
+                expanded=True,
+            ):
                 for error in result["errors"]:
                     st.error(error)
         else:
@@ -590,21 +666,30 @@ if seed_button:
     if not api_key:
         st.error("Nie można pobrać ofert bez EXTRACTR_API_KEY.")
     elif not queries:
-        st.warning("Wybierz przynajmniej jeden model lub wpisz własne wyszukiwanie.")
+        st.warning("Wybierz model lub wpisz własne wyszukiwanie.")
     else:
-        with st.spinner("Zapisuję aktualne oferty bez wysyłania alertów..."):
+        with st.spinner(
+            "Zapisuję aktualne oferty bez wysyłania alertów..."
+        ):
             saved, seed_errors = seed_database(
                 queries,
                 api_key,
                 int(max_price),
             )
 
-        st.success(f"Zapisano {saved} nowych identyfikatorów bez alertów.")
+        st.success(
+            f"Zapisano {saved} nowych identyfikatorów bez alertów."
+        )
 
         if seed_errors:
-            with st.expander("⚠️ Szczegóły błędów", expanded=True):
+            with st.expander(
+                "⚠️ Szczegóły błędów",
+                expanded=True,
+            ):
                 for error in seed_errors:
                     st.error(error)
 
 st.divider()
-st.caption(f"Zapamiętane identyfikatory ofert: {count_saved()}")
+st.caption(
+    f"Zapamiętane identyfikatory ofert: {count_saved()}"
+)
