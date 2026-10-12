@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -26,9 +27,22 @@ RETRY_DELAYS = [10, 20, 40]
 
 def normalize(text):
     text = str(text or "").lower()
-    text = text.replace("–", "-").replace("—", "-")
-    text = re.sub(r"[^a-z0-9ąćęłńóśźż]+", " ", text)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(
+        char for char in text
+        if not unicodedata.combining(char)
+    )
+    text = text.replace("ł", "l")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
     return " ".join(text.split())
+
+
+def has_phrase(text, phrases):
+    padded = f" {text} "
+    return any(
+        f" {normalize(phrase)} " in padded
+        for phrase in phrases
+    )
 
 
 def load_state():
@@ -36,10 +50,14 @@ def load_state():
         return None
 
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
+        )
         return set(str(x) for x in data.get("seen", []))
     except (OSError, ValueError, TypeError) as exc:
-        raise RuntimeError(f"Nie można odczytać historii: {exc}")
+        raise RuntimeError(
+            f"Nie można odczytać historii: {exc}"
+        )
 
 
 def save_state(seen_ids):
@@ -59,41 +77,104 @@ def matches_search(item, query):
     text = f"{title} {brand}"
 
     if query == "Nike Shox":
-        if "nike" not in text or "shox" not in title:
+        # Musi być marka Nike.
+        if not has_phrase(text, ["nike"]):
             return False
 
+        # Ubrania i akcesoria — wykluczamy w wielu językach.
         clothing_words = [
-            "kurtka", "kurtke", "kurtki", "bluza", "bluzy",
-            "hoodie", "sweatshirt", "koszulka", "koszulki",
-            "t shirt", "spodenki", "spodnie", "czapka",
-            "czapki", "jacket", "shirt", "shorts", "trousers",
-            "wiatrowka", "socks", "skarpetki", "tee",
+            "tee", "t shirt", "shirt", "shirts",
+            "sweatshirt", "hoodie", "sweater", "jumper",
+            "blouse", "shorts", "trousers", "pants",
+            "jacket", "coat", "cap", "hat", "bag",
+            "backpack", "socks", "dress", "skirt",
+            "koszulka", "koszulki", "bluza", "bluzka",
+            "spodnie", "spodenki", "kurtka", "czapka",
+            "torba", "plecak", "skarpetki", "sukienka",
+            "spodnica", "wiatrowka", "spodnica",
+            "tricko", "triko", "mikina", "bunda",
+            "kalhoty", "kratasy", "cepice", "kosile",
+            "majica", "hlace", "jakna", "camiseta",
+            "sudadera", "chaqueta", "pantalones",
+            "camisa", "gorra", "falda", "calcetines",
+            "maglietta", "felpa", "giacca", "pantaloni",
+            "cappello", "gonna", "calzini",
+            "pull", "veste", "pantalon", "jupe",
+            "bonnet", "chaussettes", "hemd", "pullover",
+            "jacke", "hose", "muetze", "socken",
+            "shirtje", "trui", "broek", "jas", "rok",
+            "sokken", "camisola", "calcas", "casaco",
+            "gorro", "meias", "handschuhe", "handschoen",
+            "portefeuille", "wallet", "keychain",
+            "porte cle", "phone case", "etui"
         ]
 
-        if any(word in title for word in clothing_words):
+        if has_phrase(title, clothing_words):
             return False
 
-        shoe_models = [
-            "shox tl", "shox r4", "shox ride",
-            "shox rivalry", "shox monster", "shox turbo",
-            "shox gravity", "shox enigma", "shox nz",
-            "shox tlx", "shox bb4", "shox r2", "shox vc",
-            "shox xt", "shox avenue",
-        ]
-
+        # Słowa związane z butami w różnych językach.
         shoe_words = [
-            "buty", "sneakers", "sneaker", "shoes",
-            "obuwie", "tenisowki", "tenisky", "trainers",
-            "trampki", "sneakersy",
+            # Polski
+            "buty", "butow", "butach", "obuwie",
+            "sneakersy", "adidasy", "but sportowy",
+
+            # Czeski i słowacki
+            "boty", "tenisky", "obuv", "sportovni boty",
+            "sportovni obuv", "sportove tenisky",
+
+            # Angielski
+            "shoes", "shoe", "sneakers", "sneaker",
+            "trainers", "trainer", "footwear",
+            "running shoes",
+
+            # Niemiecki
+            "schuhe", "turnschuhe", "sportschuhe",
+
+            # Francuski
+            "chaussures", "baskets", "chaussure",
+
+            # Włoski
+            "scarpe", "scarpa",
+
+            # Hiszpański
+            "zapatillas", "zapatos", "deportivas",
+
+            # Portugalski
+            "sapatos", "sapatilhas", "tenis",
+
+            # Holenderski
+            "schoenen", "sportschoenen",
+
+            # Rumuński
+            "pantofi", "adidasi",
+
+            # Węgierski
+            "cipo", "cipok",
+
+            # Bałkańskie
+            "tenisice", "patike", "obutev",
+
+            # Turecki
+            "ayakkabi", "spor ayakkabi",
+
+            # Inne
+            "krossovki", "sneaker shoes"
         ]
 
-        if any(model in title for model in shoe_models):
+        has_shox = has_phrase(title, ["shox"])
+        has_shoes = has_phrase(title, shoe_words)
+
+        # Akceptujemy Nike Shox w dowolnym języku.
+        # Akceptujemy też "Boty Nike" lub "Nike 38,5",
+        # jeśli opis zawiera określenie obuwia albo rozmiar.
+        if has_shox:
             return True
 
-        if any(word in title for word in shoe_words):
+        if has_shoes:
             return True
 
-        if title in ("nike shox", "nike shox nike"):
+        # Krótkie tytuły typu "Nike 38,5" albo "Nike 44".
+        if re.search(r"\b\d{2}(?:\s+\d)?(?:\s+\d{1,2})?\b", title):
             return True
 
         return False
@@ -106,32 +187,40 @@ def matches_search(item, query):
             "etui", "case", "pokrowiec", "wieszak",
             "hanger", "metka", "tag", "torba",
         ]
-        if any(word in title for word in blocked):
+        if has_phrase(title, blocked):
             return False
 
         jacket_words = [
             "kurtka", "jacket", "puffer", "parka",
-            "kurtke", "kurtki",
+            "kurtke", "kurtki", "chaqueta", "giacca",
+            "doudoune", "jacke", "jas", "abrigo",
         ]
-        return any(word in title for word in jacket_words)
+        return has_phrase(title, jacket_words)
 
     if query == "Ralph Lauren Quarter Zip":
-        brands = ["ralph lauren", "polo ralph lauren", "chaps"]
-        if not any(name in text for name in brands):
+        brands = [
+            "ralph lauren", "polo ralph lauren", "chaps"
+        ]
+        if not any(normalize(name) in text for name in brands):
             return False
 
         zip_phrases = [
             "quarter zip", "1 4 zip", "half zip",
-            "quarterzip", "halfzip",
+            "quarterzip", "halfzip", "quarter zip sweater",
+            "zip neck", "zip neckline", "half zip jumper",
+            "pullover quarter zip",
         ]
-        if not any(phrase in title for phrase in zip_phrases):
+        if not any(
+            normalize(phrase) in title
+            for phrase in zip_phrases
+        ):
             return False
 
         blocked = [
             "traders", "tommy hilfiger", "karta", "card",
             "sukienka", "dress", "spodnica", "skirt",
         ]
-        if any(word in title for word in blocked):
+        if has_phrase(title, blocked):
             return False
 
         return True
@@ -193,14 +282,20 @@ def get_listings(search):
         try:
             data = response.json()
         except ValueError:
-            raise RuntimeError(f"[{query}] Niepoprawna odpowiedź JSON.")
+            raise RuntimeError(
+                f"[{query}] Niepoprawna odpowiedź JSON."
+            )
 
         if not isinstance(data, dict):
-            raise RuntimeError(f"[{query}] Nieoczekiwany format odpowiedzi.")
+            raise RuntimeError(
+                f"[{query}] Nieoczekiwany format odpowiedzi."
+            )
 
         items = data.get("listings")
         if not isinstance(items, list):
-            raise RuntimeError(f"[{query}] Brak listy listings.")
+            raise RuntimeError(
+                f"[{query}] Brak listy listings."
+            )
 
         results = []
 
@@ -213,7 +308,9 @@ def get_listings(search):
                 continue
 
             try:
-                price = float(item.get("price"))
+                price = float(
+                    str(item.get("price")).replace(",", ".")
+                )
             except (TypeError, ValueError):
                 continue
 
@@ -235,7 +332,9 @@ def get_listings(search):
                 "brand": str(item.get("brand") or "Nie podano"),
                 "size": str(item.get("size") or "Nie podano"),
                 "condition": str(item.get("condition") or "Nie podano"),
-                "image": str(item.get("image") or item.get("photo_url") or ""),
+                "image": str(
+                    item.get("image") or item.get("photo_url") or ""
+                ),
                 "query": query,
                 "max_price": max_price,
             })
@@ -286,7 +385,9 @@ def send_discord(listing):
 
         if response.status_code == 429:
             try:
-                retry_after = float(response.json().get("retry_after", 2))
+                retry_after = float(
+                    response.json().get("retry_after", 2)
+                )
             except (ValueError, TypeError):
                 retry_after = 2
 
@@ -302,7 +403,8 @@ def send_discord(listing):
             continue
 
         raise RuntimeError(
-            f"Discord HTTP {response.status_code}: {response.text[:300]}"
+            f"Discord HTTP {response.status_code}: "
+            f"{response.text[:300]}"
         )
 
     raise RuntimeError("Nie udało się wysłać alertu.")
@@ -347,7 +449,10 @@ def main():
 
     if known is None:
         if failed_searches:
-            print("Część wyszukiwań nieudana. Nie inicjuję historii.")
+            print(
+                "Część wyszukiwań nieudana. "
+                "Nie inicjuję historii."
+            )
             return
 
         save_state({item["id"] for item in all_listings})
