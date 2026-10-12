@@ -30,7 +30,6 @@ RETRY_DELAYS = [5, 15]
 
 CATALOG = [
     
-CATALOG = [
     # Buty
     "Salomon ACS",
     "Salomon XT-6",
@@ -96,7 +95,6 @@ CATALOG = [
     "Dickies 874",
 ]
 
-]
 
 
 # =========================
