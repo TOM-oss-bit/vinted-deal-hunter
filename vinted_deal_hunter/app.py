@@ -29,18 +29,73 @@ MAX_SERVER_ATTEMPTS = 3
 RETRY_DELAYS = [5, 15]
 
 CATALOG = [
+    
+CATALOG = [
+    # Buty
     "Salomon ACS",
     "Salomon XT-6",
     "Salomon XT-4",
     "Salomon Speedcross",
     "Nike Shox",
     "Nike Air Max",
+    "Nike Air Force 1",
+    "Nike Dunk",
+    "Nike P-6000",
+    "Nike Vomero",
     "Adidas Campus",
     "Adidas Samba",
+    "Adidas Spezial",
+    "Adidas Gazelle",
+    "Adidas Yeezy",
     "New Balance 2002R",
     "New Balance 1906R",
+    "New Balance 9060",
     "Asics Gel-Kayano",
     "Asics Gel-NYC",
+    "Asics Gel-1130",
+    "Puma Speedcat",
+    "Mizuno Wave Rider",
+    "On Running",
+    "Hoka Clifton",
+
+    # Bluzy i ubrania
+    "Nike Tech Fleece",
+    "Nike Tech",
+    "Nike Hoodie",
+    "Adidas Originals",
+    "Adidas Essentials",
+    "Ralph Lauren Hoodie",
+    "Ralph Lauren Quarter Zip",
+    "Polo Ralph Lauren",
+    "Stone Island",
+    "C.P. Company",
+    "Carhartt",
+    "Carhartt WIP",
+    "Trapstar",
+    "Supreme",
+    "Stussy",
+    "Essentials Fear of God",
+    "Represent",
+    "Palm Angels",
+    "Bape",
+    "Gallery Dept",
+
+    # Kurtki
+    "Moncler Maya",
+    "The North Face Nuptse",
+    "The North Face",
+    "Arc'teryx",
+    "Canada Goose",
+    "Nike Puffer Jacket",
+    "Adidas Track Jacket",
+
+    # Spodnie
+    "Nike Tech Fleece Pants",
+    "Adidas Track Pants",
+    "Carhartt Cargo Pants",
+    "Dickies 874",
+]
+
 ]
 
 
