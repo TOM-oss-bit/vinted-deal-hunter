@@ -28,10 +28,14 @@ def load_state():
         return None
 
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads(
+            STATE_FILE.read_text(encoding="utf-8")
+        )
         return set(str(x) for x in data.get("seen", []))
     except (OSError, ValueError, TypeError) as exc:
-        raise RuntimeError(f"Nie można odczytać historii: {exc}")
+        raise RuntimeError(
+            f"Nie można odczytać historii: {exc}"
+        )
 
 
 def save_state(seen_ids):
@@ -71,20 +75,27 @@ def get_listings(query, max_price):
             )
         except requests.RequestException as exc:
             print(f"[{query}] Błąd połączenia: {exc}")
+
             if attempt < MAX_ATTEMPTS - 1:
                 delay = RETRY_DELAYS[attempt]
                 print(f"Ponawiam za {delay} s.")
                 time.sleep(delay)
                 continue
+
             return None
 
         if response.status_code in (502, 503, 504):
-            print(f"[{query}] Extractr HTTP {response.status_code}")
+            print(
+                f"[{query}] Extractr HTTP "
+                f"{response.status_code}"
+            )
+
             if attempt < MAX_ATTEMPTS - 1:
                 delay = RETRY_DELAYS[attempt]
                 print(f"Ponawiam za {delay} s.")
                 time.sleep(delay)
                 continue
+
             return None
 
         if response.status_code == 429:
@@ -100,10 +111,14 @@ def get_listings(query, max_price):
         try:
             data = response.json()
         except ValueError:
-            raise RuntimeError(f"[{query}] API zwróciło niepoprawny JSON.")
+            raise RuntimeError(
+                f"[{query}] API zwróciło niepoprawny JSON."
+            )
 
         if not isinstance(data, dict):
-            raise RuntimeError(f"[{query}] Nieoczekiwany format odpowiedzi.")
+            raise RuntimeError(
+                f"[{query}] Nieoczekiwany format odpowiedzi."
+            )
 
         items = data.get("listings")
 
@@ -123,30 +138,28 @@ def get_listings(query, max_price):
             if not listing_id:
                 continue
 
-            price = item.get("price")
             try:
-                numeric_price = float(price)
+                price = float(item.get("price"))
             except (TypeError, ValueError):
-                print(
-                    f"[{query}] Pomijam ofertę bez prawidłowej ceny: "
-                    f"{item.get('title', 'Oferta')}"
-                )
                 continue
 
-            # Dodatkowe zabezpieczenie limitu ceny.
-            if numeric_price > max_price:
+            if price < 0 or price > max_price:
                 continue
 
             results.append({
                 "id": str(listing_id),
                 "title": str(item.get("title") or "Oferta Vinted"),
                 "url": str(item.get("url") or ""),
-                "price": numeric_price,
+                "price": price,
                 "currency": str(item.get("currency") or "PLN"),
                 "brand": str(item.get("brand") or "Nie podano"),
                 "size": str(item.get("size") or "Nie podano"),
                 "condition": str(item.get("condition") or "Nie podano"),
-                "image": str(item.get("image") or item.get("photo_url") or ""),
+                "image": str(
+                    item.get("image")
+                    or item.get("photo_url")
+                    or ""
+                ),
                 "query": query,
                 "max_price": max_price,
             })
@@ -177,16 +190,61 @@ def send_discord(listing):
     if listing["image"].startswith("https://"):
         embed["thumbnail"] = {"url": listing["image"]}
 
-    response = requests.post(
-        WEBHOOK_URL,
-        json={"embeds": [embed]},
-        timeout=30,
-    )
+    for attempt in range(6):
+        try:
+            response = requests.post(
+                WEBHOOK_URL,
+                json={"embeds": [embed]},
+                timeout=30,
+            )
+        except requests.RequestException:
+            if attempt == 5:
+                raise
 
-    if response.status_code not in (200, 204):
+            delay = min(2 ** attempt, 15)
+            print(
+                f"Błąd połączenia z Discordem. "
+                f"Ponawiam za {delay} s."
+            )
+            time.sleep(delay)
+            continue
+
+        if response.status_code in (200, 204):
+            return
+
+        if response.status_code == 429:
+            try:
+                retry_after = float(
+                    response.json().get("retry_after", 2)
+                )
+            except (ValueError, TypeError):
+                retry_after = 2
+
+            delay = max(retry_after, 1) + 0.5
+            print(
+                f"Discord HTTP 429. "
+                f"Czekam {delay:.1f} s."
+            )
+            time.sleep(delay)
+            continue
+
+        if response.status_code >= 500 and attempt < 5:
+            delay = min(2 ** attempt, 15)
+            print(
+                f"Discord HTTP {response.status_code}. "
+                f"Ponawiam za {delay} s."
+            )
+            time.sleep(delay)
+            continue
+
         raise RuntimeError(
-            f"Discord HTTP {response.status_code}: {response.text[:300]}"
+            f"Discord HTTP {response.status_code}: "
+            f"{response.text[:300]}"
         )
+
+    raise RuntimeError(
+        "Nie udało się wysłać alertu po kilku próbach."
+    )
 
 
 def main():
@@ -210,35 +268,45 @@ def main():
             listings = get_listings(query, max_price)
         except RuntimeError as exc:
             print(f"[{query}] Błąd: {exc}")
-            failed_searches += 1
             listings = None
 
         if listings is None:
             failed_searches += 1
             print(f"[{query}] Pomijam to wyszukiwanie.")
         else:
-            print(f"[{query}] Sprawdzone oferty: {len(listings)}")
+            print(
+                f"[{query}] Sprawdzone oferty: "
+                f"{len(listings)}"
+            )
             all_listings.extend(listings)
 
         if index < len(SEARCHES) - 1:
             time.sleep(3)
 
     if failed_searches == len(SEARCHES):
-        print("Wszystkie wyszukiwania nieudane. Historia bez zmian.")
+        print(
+            "Wszystkie wyszukiwania nieudane. "
+            "Historia bez zmian."
+        )
         return
 
-    # Pierwsze uruchomienie: zapisz znalezione oferty,
-    # ale nie wysyłaj alertów dla starych ogłoszeń.
     if known is None:
         if failed_searches:
-            print("Część zapytań nieudana. Nie inicjuję historii.")
+            print(
+                "Część zapytań nieudana. "
+                "Nie inicjuję historii."
+            )
             return
 
         save_state({item["id"] for item in all_listings})
-        print("Zapisano historię początkową. Alertów nie wysłano.")
+        print(
+            "Zapisano historię początkową. "
+            "Alertów nie wysłano."
+        )
         return
 
     sent = 0
+    failed_alerts = 0
 
     for listing in all_listings:
         if listing["id"] in known:
@@ -248,20 +316,25 @@ def main():
             send_discord(listing)
         except (RuntimeError, requests.RequestException) as exc:
             print(f"Błąd wysyłania alertu: {exc}")
+            failed_alerts += 1
             continue
 
         known.add(listing["id"])
         save_state(known)
         sent += 1
+
         print(f"Wysłano alert: {listing['title']}")
+
+        # Przerwa zmniejsza ryzyko limitów Discorda.
+        time.sleep(1.2)
 
     save_state(known)
 
     print(f"\nŁącznie sprawdzone oferty: {len(all_listings)}")
     print(f"Wysłane alerty: {sent}")
     print(f"Nieudane wyszukiwania: {failed_searches}")
+    print(f"Nieudane alerty: {failed_alerts}")
 
 
 if __name__ == "__main__":
     main()
-
