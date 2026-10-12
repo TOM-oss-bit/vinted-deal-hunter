@@ -1,6 +1,7 @@
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from datetime import datetime, timezone
@@ -14,13 +15,57 @@ API_KEY = os.getenv("EXTRACTR_API_KEY", "").strip()
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 
 SEARCHES = [
-    {"query": "Nike Shox", "max_price": 100},
-    {"query": "Moncler Maya", "max_price": 150},
-    {"query": "Ralph Lauren Quarter Zip", "max_price": 30},
+    {
+        "query": "Nike Shox",
+        "max_price": 100,
+        "keywords": ["shox"],
+        "required_groups": [["nike"]],
+        "blocked": [
+            "card", "rookie", "patch", "autograph",
+            "haliburton", "curry", "leonard", "lavine",
+            "basketball card", "karta"
+        ],
+        "must_match_any": ["shox"],
+    },
+    {
+        "query": "Moncler Maya",
+        "max_price": 150,
+        "keywords": ["moncler", "maya"],
+        "required_groups": [["moncler"], ["maya"]],
+        "blocked": [
+            "etui", "case", "pokrowiec", "wieszak",
+            "hanger", "metka", "tag", "torba na ubrania"
+        ],
+        "must_match_any": ["kurtka", "jacket", "maya", "moncler"],
+    },
+    {
+        "query": "Ralph Lauren Quarter Zip",
+        "max_price": 30,
+        "keywords": ["quarter", "zip"],
+        "required_groups": [
+            ["ralph lauren", "polo ralph lauren", "chaps"]
+        ],
+        "blocked": [
+            "traders", "tommy hilfiger", "karta", "card",
+            "sukienka", "dress", "spódnica", "skirt"
+        ],
+        "must_match_any": [
+            "quarter zip", "quarter-zip", "1/4 zip",
+            "half zip", "half-zip", "polo ralph lauren",
+            "ralph lauren", "chaps"
+        ],
+    },
 ]
 
 MAX_ATTEMPTS = 4
 RETRY_DELAYS = [10, 20, 40]
+
+
+def normalize(text):
+    text = str(text or "").lower()
+    text = text.replace("–", "-").replace("—", "-")
+    text = re.sub(r"[^a-z0-9ąćęłńóśźż]+", " ", text)
+    return " ".join(text.split())
 
 
 def load_state():
@@ -49,7 +94,67 @@ def save_state(seen_ids):
     )
 
 
-def get_listings(query, max_price):
+def matches_search(item, search):
+    title = normalize(item.get("title", ""))
+    brand = normalize(item.get("brand", ""))
+    text = f"{title} {brand}"
+
+    # Każda grupa wymaga przynajmniej jednego dopasowania.
+    for group in search["required_groups"]:
+        if not any(normalize(word) in text for word in group):
+            return False
+
+    # Odrzucamy oczywiste, niepasujące wyniki.
+    for word in search["blocked"]:
+        if normalize(word) in title:
+            return False
+
+    # Wymagane słowa muszą wystąpić w tytule.
+    title_normalized = normalize(title)
+    if not any(
+        normalize(word) in title_normalized
+        for word in search["must_match_any"]
+    ):
+        return False
+
+    if search["query"] == "Nike Shox":
+        # Samo słowo "Shox" bez Nike nie wystarczy.
+        if "nike" not in text or "shox" not in title:
+            return False
+
+    if search["query"] == "Moncler Maya":
+        if "moncler" not in text or "maya" not in title:
+            return False
+
+    if search["query"] == "Ralph Lauren Quarter Zip":
+        has_brand = any(
+            word in text
+            for word in [
+                "ralph lauren",
+                "polo ralph lauren",
+                "chaps",
+            ]
+        )
+        has_zip = any(
+            word in title
+            for word in [
+                "quarter zip",
+                "quarter-zip",
+                "1 4 zip",
+                "half zip",
+                "half-zip",
+            ]
+        )
+        if not has_brand or not has_zip:
+            return False
+
+    return True
+
+
+def get_listings(search):
+    query = search["query"]
+    max_price = search["max_price"]
+
     params = {
         "query": query,
         "marketplace": "pl",
@@ -75,31 +180,23 @@ def get_listings(query, max_price):
             )
         except requests.RequestException as exc:
             print(f"[{query}] Błąd połączenia: {exc}")
-
             if attempt < MAX_ATTEMPTS - 1:
                 delay = RETRY_DELAYS[attempt]
                 print(f"Ponawiam za {delay} s.")
                 time.sleep(delay)
                 continue
-
             return None
 
-        if response.status_code in (502, 503, 504):
+        if response.status_code in (429, 502, 503, 504):
             print(
                 f"[{query}] Extractr HTTP "
                 f"{response.status_code}"
             )
-
             if attempt < MAX_ATTEMPTS - 1:
                 delay = RETRY_DELAYS[attempt]
                 print(f"Ponawiam za {delay} s.")
                 time.sleep(delay)
                 continue
-
-            return None
-
-        if response.status_code == 429:
-            print(f"[{query}] Limit zapytań API (429).")
             return None
 
         if not response.ok:
@@ -121,11 +218,9 @@ def get_listings(query, max_price):
             )
 
         items = data.get("listings")
-
         if not isinstance(items, list):
             raise RuntimeError(
-                f"[{query}] Brak listy 'listings'. "
-                f"Pola odpowiedzi: {list(data.keys())}"
+                f"[{query}] Brak listy listings."
             )
 
         results = []
@@ -146,15 +241,23 @@ def get_listings(query, max_price):
             if price < 0 or price > max_price:
                 continue
 
+            if not matches_search(item, search):
+                print(
+                    f"[{query}] Odrzucono: "
+                    f"{item.get('title', 'bez tytułu')}"
+                )
+                continue
+
             results.append({
                 "id": str(listing_id),
                 "title": str(item.get("title") or "Oferta Vinted"),
                 "url": str(item.get("url") or ""),
                 "price": price,
-                "currency": str(item.get("currency") or "PLN"),
                 "brand": str(item.get("brand") or "Nie podano"),
                 "size": str(item.get("size") or "Nie podano"),
-                "condition": str(item.get("condition") or "Nie podano"),
+                "condition": str(
+                    item.get("condition") or "Nie podano"
+                ),
                 "image": str(
                     item.get("image")
                     or item.get("photo_url")
@@ -197,15 +300,11 @@ def send_discord(listing):
                 json={"embeds": [embed]},
                 timeout=30,
             )
-        except requests.RequestException:
+        except requests.RequestException as exc:
             if attempt == 5:
                 raise
-
             delay = min(2 ** attempt, 15)
-            print(
-                f"Błąd połączenia z Discordem. "
-                f"Ponawiam za {delay} s."
-            )
+            print(f"Błąd połączenia Discord: {exc}")
             time.sleep(delay)
             continue
 
@@ -221,19 +320,13 @@ def send_discord(listing):
                 retry_after = 2
 
             delay = max(retry_after, 1) + 0.5
-            print(
-                f"Discord HTTP 429. "
-                f"Czekam {delay:.1f} s."
-            )
+            print(f"Discord 429 — czekam {delay:.1f} s.")
             time.sleep(delay)
             continue
 
         if response.status_code >= 500 and attempt < 5:
             delay = min(2 ** attempt, 15)
-            print(
-                f"Discord HTTP {response.status_code}. "
-                f"Ponawiam za {delay} s."
-            )
+            print(f"Discord HTTP {response.status_code}.")
             time.sleep(delay)
             continue
 
@@ -242,9 +335,7 @@ def send_discord(listing):
             f"{response.text[:300]}"
         )
 
-    raise RuntimeError(
-        "Nie udało się wysłać alertu po kilku próbach."
-    )
+    raise RuntimeError("Nie udało się wysłać alertu.")
 
 
 def main():
@@ -259,24 +350,23 @@ def main():
     failed_searches = 0
 
     for index, search in enumerate(SEARCHES):
-        query = search["query"]
-        max_price = search["max_price"]
-
-        print(f"\nSzukam: {query} | limit: {max_price} zł")
+        print(
+            f"\nSzukam: {search['query']} | "
+            f"limit: {search['max_price']} zł"
+        )
 
         try:
-            listings = get_listings(query, max_price)
+            listings = get_listings(search)
         except RuntimeError as exc:
-            print(f"[{query}] Błąd: {exc}")
+            print(f"Błąd wyszukiwania: {exc}")
             listings = None
 
         if listings is None:
             failed_searches += 1
-            print(f"[{query}] Pomijam to wyszukiwanie.")
+            print("To wyszukiwanie pominięto.")
         else:
             print(
-                f"[{query}] Sprawdzone oferty: "
-                f"{len(listings)}"
+                f"Pasujące oferty po filtrze: {len(listings)}"
             )
             all_listings.extend(listings)
 
@@ -284,25 +374,19 @@ def main():
             time.sleep(3)
 
     if failed_searches == len(SEARCHES):
-        print(
-            "Wszystkie wyszukiwania nieudane. "
-            "Historia bez zmian."
-        )
+        print("Wszystkie wyszukiwania nieudane. Historia bez zmian.")
         return
 
     if known is None:
         if failed_searches:
             print(
-                "Część zapytań nieudana. "
+                "Część wyszukiwań nieudana. "
                 "Nie inicjuję historii."
             )
             return
 
         save_state({item["id"] for item in all_listings})
-        print(
-            "Zapisano historię początkową. "
-            "Alertów nie wysłano."
-        )
+        print("Zapisano historię początkową. Alertów nie wysłano.")
         return
 
     sent = 0
@@ -315,7 +399,7 @@ def main():
         try:
             send_discord(listing)
         except (RuntimeError, requests.RequestException) as exc:
-            print(f"Błąd wysyłania alertu: {exc}")
+            print(f"Błąd alertu: {exc}")
             failed_alerts += 1
             continue
 
@@ -324,13 +408,11 @@ def main():
         sent += 1
 
         print(f"Wysłano alert: {listing['title']}")
-
-        # Przerwa zmniejsza ryzyko limitów Discorda.
         time.sleep(1.2)
 
     save_state(known)
 
-    print(f"\nŁącznie sprawdzone oferty: {len(all_listings)}")
+    print(f"\nŁącznie pasujących ofert: {len(all_listings)}")
     print(f"Wysłane alerty: {sent}")
     print(f"Nieudane wyszukiwania: {failed_searches}")
     print(f"Nieudane alerty: {failed_alerts}")
