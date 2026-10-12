@@ -10,7 +10,7 @@ import streamlit as st
 
 
 # =========================
-# KONFIGURACJA
+# USTAWIENIA
 # =========================
 
 st.set_page_config(
@@ -21,9 +21,8 @@ st.set_page_config(
 
 API_URL = "https://api.extractr.dev/vinted/search"
 DB_PATH = "vinted_deals.db"
-RESULTS_PER_QUERY = 20
-REQUEST_DELAY_SECONDS = 42
-REQUEST_TIMEOUT_SECONDS = 30
+REQUEST_TIMEOUT = 30
+PAUSE_BETWEEN_QUERIES = 42
 
 CATALOG = [
     "Salomon ACS",
@@ -42,327 +41,322 @@ CATALOG = [
 
 
 # =========================
-# SEKRETY
+# SECRETS
 # =========================
 
-def get_secret(name, default=""):
-    try:
-        value = st.secrets.get(name, default)
+def get_secret(*names):
+    for name in names:
+        try:
+            value = st.secrets.get(name, "")
+        except Exception:
+            value = ""
+
         if value:
             return str(value).strip()
-    except Exception:
-        pass
 
-    return os.getenv(name, default).strip()
+        value = os.getenv(name, "")
+        if value:
+            return str(value).strip()
 
-
-def get_discord_webhook():
-    return (
-        get_secret("DISCORD_WEBHOOK_URL")
-        or get_secret("DISCORD_WEBHOOK")
-        or get_secret("DISCORD_WEBHOOK_URL_VINTED")
-    )
+    return ""
 
 
 # =========================
 # BAZA DANYCH
 # =========================
 
-def get_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS seen (
-            listing_id TEXT PRIMARY KEY,
-            title TEXT,
-            url TEXT,
-            price REAL,
-            first_seen TEXT,
-            query TEXT
-        )
-    """)
-    conn.commit()
+def db_connect():
+    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn.row_factory = sqlite3.Row
     return conn
 
 
-def safe_price(value):
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+def initialize_database():
+    with db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS seen (
+                listing_id TEXT PRIMARY KEY,
+                title TEXT,
+                url TEXT,
+                first_seen TEXT,
+                notified INTEGER DEFAULT 1,
+                discord_error TEXT
+            )
+            """
+        )
+
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(seen)").fetchall()
+        }
+
+        # Obsługa starszej wersji bazy danych.
+        if "title" not in columns:
+            conn.execute("ALTER TABLE seen ADD COLUMN title TEXT")
+
+        if "url" not in columns:
+            conn.execute("ALTER TABLE seen ADD COLUMN url TEXT")
+
+        if "first_seen" not in columns:
+            conn.execute("ALTER TABLE seen ADD COLUMN first_seen TEXT")
+
+        if "notified" not in columns:
+            # Oferty zapisane przez starszą wersję traktujemy jako już
+            # obsłużone, aby nie wysłać nagle wielu starych alertów.
+            conn.execute(
+                "ALTER TABLE seen ADD COLUMN notified INTEGER DEFAULT 1"
+            )
+
+        if "discord_error" not in columns:
+            conn.execute(
+                "ALTER TABLE seen ADD COLUMN discord_error TEXT"
+            )
 
 
-def get_seen_ids():
-    conn = get_connection()
-    try:
-        rows = conn.execute(
-            "SELECT listing_id FROM seen"
-        ).fetchall()
-        return {str(row[0]) for row in rows}
-    finally:
-        conn.close()
+def is_known(listing_id):
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM seen WHERE listing_id = ?",
+            (str(listing_id),),
+        ).fetchone()
+    return row is not None
 
 
-def save_listing(item, query):
-    listing_id = str(item.get("listing_id", "")).strip()
-
+def save_listing(listing):
+    listing_id = str(listing.get("listing_id", "")).strip()
     if not listing_id:
         return False
 
-    conn = get_connection()
-
-    try:
-        cursor = conn.execute("""
+    with db_connect() as conn:
+        cursor = conn.execute(
+            """
             INSERT OR IGNORE INTO seen
-            (listing_id, title, url, price, first_seen, query)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            listing_id,
-            str(item.get("title", "")),
-            str(item.get("url", "")),
-            safe_price(item.get("price")),
-            datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            query,
-        ))
-
-        conn.commit()
-        return cursor.rowcount > 0
-
-    finally:
-        conn.close()
-
-
-# =========================
-# EXTRACTR API
-# =========================
-
-class RateLimitError(Exception):
-    def __init__(self, wait_seconds=60):
-        self.wait_seconds = wait_seconds
-        super().__init__(
-            f"Extractr ograniczył liczbę zapytań. "
-            f"Odczekaj około {wait_seconds} sekund."
+                (listing_id, title, url, first_seen, notified, discord_error)
+            VALUES (?, ?, ?, ?, 1, NULL)
+            """,
+            (
+                listing_id,
+                str(listing.get("title", "")),
+                str(listing.get("url", "")),
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
 
+    return cursor.rowcount > 0
 
-class ExtractrError(Exception):
-    pass
 
+def count_saved():
+    with db_connect() as conn:
+        row = conn.execute("SELECT COUNT(*) AS total FROM seen").fetchone()
+    return int(row["total"])
+
+
+# =========================
+# EXTRACTR
+# =========================
 
 def extract_items(data):
+    """Odnajduje listę ofert także w zagnieżdżonej odpowiedzi JSON."""
     if isinstance(data, list):
-        return [
-            item for item in data
-            if isinstance(item, dict)
-        ]
+        if not data:
+            return []
+
+        if any(
+            isinstance(item, dict)
+            and any(key in item for key in ("listing_id", "id", "url"))
+            for item in data
+        ):
+            return data
+
+        for item in data:
+            result = extract_items(item)
+            if result:
+                return result
+
+        return []
 
     if isinstance(data, dict):
-        for key in ("listings", "items", "results", "data"):
-            value = data.get(key)
+        # Najbardziej prawdopodobne nazwy pól zawierających oferty.
+        for key in (
+            "listings",
+            "items",
+            "results",
+            "offers",
+            "products",
+            "data",
+        ):
+            if key in data:
+                result = extract_items(data[key])
+                if result:
+                    return result
 
-            if isinstance(value, list):
-                return [
-                    item for item in value
-                    if isinstance(item, dict)
-                ]
-
-            if isinstance(value, dict):
-                for nested_key in ("listings", "items", "results"):
-                    nested = value.get(nested_key)
-
-                    if isinstance(nested, list):
-                        return [
-                            item for item in nested
-                            if isinstance(item, dict)
-                        ]
+        # Niektóre odpowiedzi mogą zawierać pojedynczą ofertę.
+        if any(key in data for key in ("listing_id", "id")):
+            return [data]
 
     return []
 
 
-def load_extractr(query, api_key, max_price=None):
+def normalize_listing(item):
+    if not isinstance(item, dict):
+        return None
+
+    listing_id = (
+        item.get("listing_id")
+        or item.get("id")
+        or item.get("item_id")
+    )
+
+    url = item.get("url") or item.get("share_url") or ""
+    title = item.get("title") or item.get("name") or "Oferta Vinted"
+
+    # Jeśli API nie udostępnia ID, spróbuj użyć URL.
+    if not listing_id and url:
+        listing_id = url
+
+    if not listing_id:
+        return None
+
+    price = (
+        item.get("price")
+        or item.get("total_price")
+        or item.get("discounted_price")
+        or "Brak danych"
+    )
+
+    currency = item.get("currency") or "PLN"
+    brand = item.get("brand") or "Nie podano"
+    size = item.get("size") or "Nie podano"
+    condition = item.get("condition") or "Nie podano"
+    image = item.get("image") or item.get("thumbnail") or ""
+
+    return {
+        "listing_id": str(listing_id),
+        "title": str(title),
+        "url": str(url),
+        "price": str(price),
+        "currency": str(currency),
+        "brand": str(brand),
+        "size": str(size),
+        "condition": str(condition),
+        "image": str(image),
+    }
+
+
+def load_extractr(query, api_key, max_price):
+    params = {
+        "query": query,
+        "marketplace": "pl",
+        "page": 1,
+        "limit": 20,
+        "order": "newest_first",
+    }
+
+    if max_price > 0:
+        params["price_to"] = max_price
+
     headers = {
         "X-API-Key": api_key,
         "Accept": "application/json",
     }
 
-    params = {
-        "query": query,
-        "marketplace": "pl",
-        "page": 1,
-        "limit": RESULTS_PER_QUERY,
-        "order": "newest_first",
-    }
-
-    if max_price is not None:
-        params["price_to"] = float(max_price)
-
-    try:
-        response = requests.get(
-            API_URL,
-            headers=headers,
-            params=params,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-    except requests.RequestException as exc:
-        raise ExtractrError(
-            f"Błąd połączenia z Extractr: {exc}"
-        ) from exc
+    response = requests.get(
+        API_URL,
+        params=params,
+        headers=headers,
+        timeout=REQUEST_TIMEOUT,
+    )
 
     if response.status_code == 429:
-        wait_seconds = 60
-
-        match = re.search(
-            r"(?:retry in|wait)\s*(\d+)\s*s?",
-            response.text,
-            re.IGNORECASE,
+        raise RuntimeError(
+            "LIMIT 429: Extractr ograniczył liczbę zapytań. "
+            "Poczekaj przed kolejnym skanem."
         )
 
-        if match:
-            wait_seconds = max(1, int(match.group(1)))
-
-        retry_header = response.headers.get("Retry-After")
-
-        if retry_header and retry_header.isdigit():
-            wait_seconds = max(
-                wait_seconds,
-                int(retry_header),
-            )
-
-        raise RateLimitError(wait_seconds)
-
-    if response.status_code in (401, 403):
-        raise ExtractrError(
-            "Extractr odrzucił klucz API. Sprawdź "
-            "EXTRACTR_API_KEY w Streamlit Secrets."
-        )
-
-    if response.status_code >= 400:
-        raise ExtractrError(
-            f"Extractr zwrócił HTTP {response.status_code}: "
-            f"{response.text[:400]}"
+    if not response.ok:
+        # Nie pokazujemy nagłówków, klucza API ani innych sekretów.
+        body = response.text[:500]
+        raise RuntimeError(
+            f"Extractr HTTP {response.status_code}: {body}"
         )
 
     try:
         data = response.json()
-    except ValueError as exc:
-        raise ExtractrError(
-            "Extractr zwrócił nieprawidłową odpowiedź JSON."
-        ) from exc
+    except ValueError:
+        raise RuntimeError(
+            "Extractr zwrócił odpowiedź, która nie jest poprawnym JSON-em."
+        )
 
     items = extract_items(data)
 
-    if not items and isinstance(data, dict) and data.get("error"):
-        raise ExtractrError(
-            f"Extractr zgłosił błąd: {data['error']}"
+    if not items:
+        if isinstance(data, dict):
+            keys = ", ".join(str(key) for key in list(data.keys())[:20])
+            details = f"Klucze odpowiedzi: {keys or '(brak)'}"
+        else:
+            details = f"Typ odpowiedzi: {type(data).__name__}"
+
+        raise RuntimeError(
+            "Odpowiedź Extractr nie zawiera rozpoznanej listy ofert. "
+            + details
         )
 
-    return items
+    normalized = []
+    for item in items:
+        listing = normalize_listing(item)
+        if listing:
+            normalized.append(listing)
+
+    return normalized
 
 
 # =========================
 # DISCORD
 # =========================
 
-def send_discord(item, query, webhook_url):
-    title = str(item.get("title") or "Oferta Vinted")
-    url = str(item.get("url") or "")
-    image_url = str(
-        item.get("image")
-        or item.get("thumbnail")
-        or ""
-    )
-
-    brand = str(item.get("brand") or "Nie podano")
-    size = str(item.get("size") or "Nie podano")
-    condition = str(item.get("condition") or "Nie podano")
-    currency = str(item.get("currency") or "PLN")
-
-    price = safe_price(item.get("price"))
-    total_price = safe_price(item.get("total_price"))
-
-    price_text = (
-        f"{price:.2f} {currency}"
-        if price is not None
-        else f"Nie podano {currency}"
-    )
-
-    fields = [
-        {
-            "name": "Cena",
-            "value": price_text,
-            "inline": True,
-        },
-        {
-            "name": "Marka",
-            "value": brand[:100],
-            "inline": True,
-        },
-        {
-            "name": "Rozmiar",
-            "value": size[:100],
-            "inline": True,
-        },
-        {
-            "name": "Stan",
-            "value": condition[:100],
-            "inline": True,
-        },
-        {
-            "name": "Wyszukiwana fraza",
-            "value": query[:100],
-            "inline": True,
-        },
-    ]
-
-    if total_price is not None:
-        fields.append({
-            "name": "Cena z opłatą",
-            "value": f"{total_price:.2f} {currency}",
-            "inline": True,
-        })
+def send_discord(webhook_url, listing, query):
+    if not webhook_url:
+        raise RuntimeError(
+            "Brak webhooka Discord. Dodaj DISCORD_WEBHOOK_URL "
+            "w Streamlit Secrets."
+        )
 
     embed = {
-        "title": title[:250],
-        "color": 0x5865F2,
-        "fields": fields,
-        "footer": {
-            "text": "Vinted Deal Hunter"
-        },
-        "timestamp": datetime.now(
-            timezone.utc
-        ).isoformat(timespec="seconds"),
+        "title": listing["title"][:256],
+        "url": listing["url"] or None,
+        "description": (
+            f"**Cena:** {listing['price']} {listing['currency']}\n"
+            f"**Marka:** {listing['brand']}\n"
+            f"**Rozmiar:** {listing['size']}\n"
+            f"**Stan:** {listing['condition']}\n"
+            f"**Wyszukiwanie:** {query}"
+        )[:4000],
+        "footer": {"text": "Vinted Deal Hunter"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    if url.startswith("https://"):
-        embed["url"] = url
+    if listing["image"].startswith("https://") or listing["image"].startswith("http://"):
+        embed["thumbnail"] = {"url": listing["image"]}
 
-    if image_url.startswith("https://"):
-        embed["thumbnail"] = {
-            "url": image_url
-        }
-
-    payload = {
-        "content": "🔎 **Nowa oferta wykryta na Vinted!**",
-        "embeds": [embed],
-    }
+    payload = {"embeds": [embed]}
 
     try:
         response = requests.post(
             webhook_url,
             json=payload,
-            timeout=15,
+            timeout=REQUEST_TIMEOUT,
         )
     except requests.RequestException as exc:
-        return False, f"Błąd połączenia z Discordem: {exc}"
-
-    if response.status_code not in (200, 204):
-        return False, (
-            f"Discord zwrócił HTTP {response.status_code}: "
-            f"{response.text[:300]}"
+        raise RuntimeError(
+            f"Nie udało się połączyć z Discordem: {exc}"
         )
 
-    return True, "OK"
+    if response.status_code not in (200, 204):
+        body = response.text[:500]
+        raise RuntimeError(
+            f"Discord HTTP {response.status_code}: {body}"
+        )
 
 
 # =========================
@@ -370,308 +364,247 @@ def send_discord(item, query, webhook_url):
 # =========================
 
 def scan_queries(queries, api_key, webhook_url, max_price):
-    seen_ids = get_seen_ids()
-
-    sent_count = 0
-    new_count = 0
-    checked_count = 0
+    checked = 0
+    new_offers = 0
+    sent = 0
     errors = []
     rate_limited = False
 
     for index, query in enumerate(queries):
         query = query.strip()
-
         if not query:
             continue
 
-        if index > 0:
-            time.sleep(REQUEST_DELAY_SECONDS)
-
         try:
-            items = load_extractr(
-                query=query,
-                api_key=api_key,
-                max_price=max_price,
-            )
+            listings = load_extractr(query, api_key, max_price)
+            checked += len(listings)
 
-        except RateLimitError as exc:
-            errors.append(str(exc))
-            rate_limited = True
-            break
+            for listing in listings:
+                listing_id = listing["listing_id"]
 
-        except ExtractrError as exc:
-            errors.append(f"{query}: {exc}")
-            continue
+                if is_known(listing_id):
+                    continue
 
-        checked_count += len(items)
+                new_offers += 1
 
-        for item in items:
-            listing_id = str(
-                item.get("listing_id", "")
-            ).strip()
+                # Jeśli wysyłka nie powiedzie się, oferta NIE zostanie
+                # zapisana jako obsłużona. Kolejny skan spróbuje ponownie.
+                try:
+                    send_discord(webhook_url, listing, query)
+                except Exception as exc:
+                    message = f"{query} — {listing['title']}: {exc}"
+                    errors.append(message)
+                    continue
 
-            if not listing_id or listing_id in seen_ids:
-                continue
+                # Zapis dopiero po potwierdzonej wysyłce.
+                if save_listing(listing):
+                    sent += 1
 
-            new_count += 1
+        except Exception as exc:
+            message = f"{query}: {exc}"
+            errors.append(message)
 
-            inserted = save_listing(item, query)
-            seen_ids.add(listing_id)
+            if "429" in str(exc) or "LIMIT" in str(exc).upper():
+                rate_limited = True
+                break
 
-            if not inserted:
-                continue
-
-            if webhook_url:
-                success, message = send_discord(
-                    item,
-                    query,
-                    webhook_url,
-                )
-
-                if success:
-                    sent_count += 1
-                else:
-                    errors.append(
-                        f"Discord — "
-                        f"{item.get('title', listing_id)}: "
-                        f"{message}"
-                    )
+        if index < len(queries) - 1 and not rate_limited:
+            time.sleep(PAUSE_BETWEEN_QUERIES)
 
     return {
-        "sent": sent_count,
-        "new": new_count,
-        "checked": checked_count,
+        "checked": checked,
+        "new": new_offers,
+        "sent": sent,
         "errors": errors,
         "rate_limited": rate_limited,
     }
 
 
-def initialize_database(queries, api_key, max_price):
-    initialized = 0
-    checked = 0
+# =========================
+# INICJALIZACJA
+# =========================
+
+def seed_database(queries, api_key, max_price):
+    saved = 0
     errors = []
     rate_limited = False
 
     for index, query in enumerate(queries):
-        if index > 0:
-            time.sleep(REQUEST_DELAY_SECONDS)
-
-        try:
-            items = load_extractr(
-                query,
-                api_key,
-                max_price,
-            )
-
-        except RateLimitError as exc:
-            errors.append(str(exc))
-            rate_limited = True
-            break
-
-        except ExtractrError as exc:
-            errors.append(f"{query}: {exc}")
+        query = query.strip()
+        if not query:
             continue
 
-        checked += len(items)
+        try:
+            listings = load_extractr(query, api_key, max_price)
 
-        for item in items:
-            if item.get("listing_id"):
-                if save_listing(item, query):
-                    initialized += 1
+            for listing in listings:
+                # Inicjalizacja celowo nie wysyła alertów.
+                if save_listing(listing):
+                    saved += 1
 
-    return {
-        "initialized": initialized,
-        "checked": checked,
-        "errors": errors,
-        "rate_limited": rate_limited,
-    }
+        except Exception as exc:
+            errors.append(f"{query}: {exc}")
+            if "429" in str(exc) or "LIMIT" in str(exc).upper():
+                rate_limited = True
+                break
+
+        if index < len(queries) - 1 and not rate_limited:
+            time.sleep(PAUSE_BETWEEN_QUERIES)
+
+    return saved, errors
 
 
 # =========================
-# INTERFEJS STREAMLIT
+# INTERFEJS
 # =========================
+
+initialize_database()
 
 st.title("🔎 Vinted Deal Hunter")
-st.caption(
-    "Monitor ofert Vinted i powiadomienia Discord."
+st.write("Monitor ofert Vinted i powiadomienia Discord.")
+
+st.info(
+    "Bot zapamiętuje identyfikatory ofert i wykrywa nowe pozycje. "
+    "To nie jest ścisły filtr ostatnich 24 godzin, ponieważ odpowiedź "
+    "Extractr może nie zawierać daty publikacji."
 )
 
 api_key = get_secret("EXTRACTR_API_KEY")
-webhook_url = get_discord_webhook()
 
-if not api_key:
-    st.error(
-        "Brakuje EXTRACTR_API_KEY w Streamlit Secrets. "
-        "Dodaj klucz w ustawieniach aplikacji."
-    )
-    st.stop()
+webhook_url = get_secret(
+    "DISCORD_WEBHOOK_URL",
+    "DISCORD_WEBHOOK",
+    "DISCORD_WEBHOOK_URL_VINTED",
+)
 
 with st.sidebar:
     st.header("⚙️ Ustawienia")
 
-    selected_queries = st.multiselect(
+    selected_models = st.multiselect(
         "Modele do monitorowania",
         options=CATALOG,
         default=["Salomon ACS"],
     )
 
-    custom_queries = st.text_area(
-        "Dodatkowe frazy — jedna na linię",
-        placeholder="Salomon XT-6 42\nNike Shox",
+    custom_queries_text = st.text_area(
+        "Własne wyszukiwania (jedno na linię)",
+        placeholder="np.\nSalomon XT-6 42\nNike Shox",
     )
 
-    max_price_input = st.number_input(
+    max_price = st.number_input(
         "Maksymalna cena w PLN (0 = bez limitu)",
-        min_value=0.0,
-        value=0.0,
-        step=10.0,
+        min_value=0,
+        max_value=100000,
+        value=0,
+        step=50,
     )
 
-    max_price = (
-        max_price_input
-        if max_price_input > 0
-        else None
+    st.caption(
+        "Przy wielu wyszukiwaniach skanowanie może potrwać dłużej, "
+        "ponieważ aplikacja robi przerwy, aby ograniczyć ryzyko limitu API."
     )
 
-    if webhook_url:
-        st.success("Webhook Discord skonfigurowany")
-    else:
-        st.warning(
-            "Brak webhooka Discord. Alerty nie będą wysyłane."
-        )
+queries = list(selected_models)
+custom_queries = [
+    line.strip()
+    for line in custom_queries_text.splitlines()
+    if line.strip()
+]
 
-st.info(
-    "Extractr nie zwraca daty publikacji w pokazanych polach. "
-    "Bot zapamiętuje identyfikatory ofert i wykrywa te, których "
-    "wcześniej nie widział. To nie jest ścisły filtr ostatnich 24 godzin."
-)
-
-st.warning(
-    "Przy pierwszym uruchomieniu użyj przycisku inicjalizacji, "
-    "aby zapisać aktualne oferty bez wysyłania alertów."
-)
+for query in custom_queries:
+    if query not in queries:
+        queries.append(query)
 
 col1, col2 = st.columns(2)
 
 with col1:
-    initialize_clicked = st.button(
-        "🧱 Zainicjuj bazę bez alertów",
-        use_container_width=True,
-    )
-
-with col2:
-    scan_clicked = st.button(
-        "🔍 Skanuj i wysyłaj alerty",
+    scan_button = st.button(
+        "🔍 Skanuj teraz",
         type="primary",
         use_container_width=True,
     )
 
-queries = list(selected_queries)
+with col2:
+    seed_button = st.button(
+        "🧹 Zapisz aktualne oferty bez alertów",
+        use_container_width=True,
+    )
 
-for line in custom_queries.splitlines():
-    line = line.strip()
+if not api_key:
+    st.error(
+        "Nie znaleziono EXTRACTR_API_KEY. "
+        "Dodaj go w ustawieniach Secrets aplikacji Streamlit."
+    )
 
-    if line and line not in queries:
-        queries.append(line)
+if not webhook_url:
+    st.warning(
+        "Nie znaleziono webhooka Discord. "
+        "Sprawdź nazwę sekretu DISCORD_WEBHOOK_URL."
+    )
 
-if initialize_clicked:
-    if not queries:
-        st.error(
-            "Wybierz przynajmniej jeden model "
-            "lub wpisz własną frazę."
-        )
-    else:
-        with st.spinner(
-            "Zapisuję istniejące oferty bez alertów..."
-        ):
-            result = initialize_database(
-                queries,
-                api_key,
-                max_price,
-            )
-
-        st.success(
-            f"Inicjalizacja zakończona. Zapisano "
-            f"{result['initialized']} nowych identyfikatorów "
-            f"spośród {result['checked']} sprawdzonych ofert."
-        )
-
-        for error in result["errors"]:
-            st.error(error)
-
-        if result["rate_limited"]:
-            st.warning(
-                "Osiągnięto limit API. Odczekaj wskazany czas "
-                "przed kolejną próbą."
-            )
-
-if scan_clicked:
-    if not queries:
-        st.error(
-            "Wybierz przynajmniej jeden model "
-            "lub wpisz własną frazę."
-        )
+if scan_button:
+    if not api_key:
+        st.error("Nie można skanować bez EXTRACTR_API_KEY.")
+    elif not queries:
+        st.warning("Wybierz przynajmniej jeden model lub wpisz własne wyszukiwanie.")
     else:
         with st.spinner("Skanuję oferty..."):
             result = scan_queries(
-                queries=queries,
-                api_key=api_key,
-                webhook_url=webhook_url,
-                max_price=max_price,
+                queries,
+                api_key,
+                webhook_url,
+                int(max_price),
             )
 
         st.subheader("📊 Wynik skanowania")
 
-        col1, col2, col3 = st.columns(3)
+        a, b, c = st.columns(3)
+        a.metric("Sprawdzone oferty", result["checked"])
+        b.metric("Nowe oferty", result["new"])
+        c.metric("Wysłane na Discord", result["sent"])
 
-        col1.metric(
-            "Sprawdzone oferty",
-            result["checked"],
-        )
+        if result["sent"] > 0:
+            st.success(f"Wysłano {result['sent']} powiadomień na Discord.")
 
-        col2.metric(
-            "Nowe oferty",
-            result["new"],
-        )
-
-        col3.metric(
-            "Wysłane na Discord",
-            result["sent"],
-        )
+        if result["new"] > result["sent"]:
+            st.warning(
+                f"{result['new'] - result['sent']} nowych ofert nie otrzymało "
+                "powiadomienia. Nie zostały zapisane jako obsłużone, więc "
+                "kolejny skan może spróbować ponownie."
+            )
 
         if result["rate_limited"]:
             st.warning(
-                "Extractr ograniczył liczbę zapytań. "
-                "Bot zatrzymał dalsze skanowanie. "
-                "Odczekaj przed kolejną próbą."
+                "Wykryto limit API. Skanowanie przerwano, aby nie wykonywać "
+                "dalszych zapytań. Poczekaj przed kolejną próbą."
             )
 
         if result["errors"]:
-            with st.expander("Szczegóły błędów"):
+            with st.expander("⚠️ Szczegóły błędów", expanded=True):
                 for error in result["errors"]:
                     st.error(error)
+        else:
+            st.success("Nie wykryto błędów.")
 
-        if not result["new"] and not result["errors"]:
-            st.info(
-                "Nie znaleziono ofert z nowymi identyfikatorami. "
-                "Spróbuj ponownie później."
+if seed_button:
+    if not api_key:
+        st.error("Nie można pobrać ofert bez EXTRACTR_API_KEY.")
+    elif not queries:
+        st.warning("Wybierz przynajmniej jeden model lub wpisz własne wyszukiwanie.")
+    else:
+        with st.spinner("Zapisuję aktualne oferty bez wysyłania alertów..."):
+            saved, seed_errors = seed_database(
+                queries,
+                api_key,
+                int(max_price),
             )
 
-try:
-    conn = get_connection()
+        st.success(f"Zapisano {saved} nowych identyfikatorów bez alertów.")
 
-    total_seen = conn.execute(
-        "SELECT COUNT(*) FROM seen"
-    ).fetchone()[0]
+        if seed_errors:
+            with st.expander("⚠️ Szczegóły błędów", expanded=True):
+                for error in seed_errors:
+                    st.error(error)
 
-    conn.close()
-
-    st.divider()
-    st.caption(
-        f"Zapamiętane identyfikatory ofert: {total_seen}"
-    )
-
-except Exception as exc:
-    st.warning(
-        f"Nie udało się odczytać bazy danych: {exc}"
-    )
+st.divider()
+st.caption(f"Zapamiętane identyfikatory ofert: {count_saved()}")
